@@ -46,8 +46,8 @@ To build it yourself instead: `tools\build.cmd` (writes `bin\batteryfloat.exe`).
 2. **AirPods / Beats.** Windows never gets their battery, so it is read from the Apple BLE "proximity pairing" advert
    (company 0x004C, type 0x07, 27 bytes), decoded as OpenPods/AirPodsDesktop do. It comes in **10% steps**.
    - **Matching:** the advert address rotates, so a reading is used only when its model id matches AirPods *paired with this
-     PC*. The signal must be at least -75 dBm when they are connected, or -60 dBm when they are not ("nearby").
-     Other people's AirPods are ignored, and **AirPods paired only with a phone never show**: pair them with the PC once.
+     PC*. Only AirPods **connected to this PC** appear, and the signal must be at least -75 dBm.
+     Other people's AirPods are ignored, and **AirPods connected to a phone or anything else never show**: only devices connected to this PC appear.
    - **Model id:** bytes 3-4, little-endian. For example `1F 20` = 0x201F, the AirPods Max (USB-C), the same as `PID&201F` in the Windows device id.
    - **Levels:** byte 6 holds the two bud nibbles (0-10 = x10%), and status bit 5 says which nibble is left. Byte 7 holds the
      charging bits and the case level. One-battery models (Max, Solo, Studio...) take the larger nibble.

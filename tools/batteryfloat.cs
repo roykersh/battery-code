@@ -8,7 +8,7 @@
 //  2. Apple AirPods / Beats: Windows does not get their battery, but they broadcast it in a Bluetooth LE
 //     "proximity pairing" advert (Apple company id 0x004C, type 0x07, 10% steps). A broadcast is only used
 //     when its model id matches AirPods paired with this PC and the signal is strong, so other people's
-//     AirPods nearby are ignored.
+//     AirPods are ignored.
 // Drives: removable drives plus fixed drives whose storage bus is USB / SD (IOCTL_STORAGE_QUERY_PROPERTY).
 //
 // Built with the C# 5 compiler that ships with Windows (tools\build.cmd): no $"", no ?.
@@ -411,7 +411,6 @@ namespace BatteryFloat
     class AppleScanner
     {
         public const int RssiConnected = -75;  // our own, connected AirPods: close by
-        public const int RssiNearby = -60;     // paired but not connected to this PC: must be very close
 
         readonly object gate = new object();
         readonly object wlock = new object();
@@ -487,7 +486,8 @@ namespace BatteryFloat
 
             string why;
             if (!paired) why = "ignored: no paired device of this model";
-            else if (r.Rssi < (connected ? RssiConnected : RssiNearby)) why = "ignored: signal too weak (someone else's?)";
+            else if (!connected) why = "ignored: not connected to this PC";
+            else if (r.Rssi < RssiConnected) why = "ignored: signal too weak (someone else's?)";
             else
             {
                 lock (gate)
@@ -793,7 +793,7 @@ namespace BatteryFloat
 
         static string N(int v) { return AppleReading.Valid(v) ? (v * 10).ToString() : "–"; }
 
-        Item AppleItem(string name, string key, int pid, AppleReading r, BatteryNode win, DateTime now, bool nearby)
+        Item AppleItem(string name, string key, int pid, AppleReading r, BatteryNode win, DateTime now)
         {
             var it = new Item();
             it.Key = "apple:" + key;
@@ -824,7 +824,6 @@ namespace BatteryFloat
             }
             it.Value = it.Pct >= 0 ? it.Pct + "%" : "—";
             if (it.Stale) { it.Charging = false; it.Detail = "seen " + Ago(age); }
-            else if (nearby && it.Detail == null) it.Detail = "nearby";
             return it;
         }
 
@@ -848,7 +847,7 @@ namespace BatteryFloat
                     BatteryNode win = null;
                     foreach (BatteryNode b in sn.Batteries) if (a.Container != Guid.Empty && b.Container == a.Container) win = b;
                     if (a.Container != Guid.Empty) covered.Add(a.Container);
-                    list.Add(AppleItem(a.Name, a.Mac, a.Pid, r, win, now, false));
+                    list.Add(AppleItem(a.Name, a.Mac, a.Pid, r, win, now));
                 }
 
                 // Windows-reported batteries (mice, keyboards, headsets...)
@@ -867,19 +866,6 @@ namespace BatteryFloat
                 }
                 winItems.Sort(delegate (Item x, Item y) { return string.Compare(x.Name, y.Name, StringComparison.CurrentCultureIgnoreCase); });
                 list.AddRange(winItems);
-
-                // Paired AirPods close by but connected to something else (phone, case open on the desk)
-                foreach (var kv in readings)
-                {
-                    if (usedPid.Contains(kv.Key)) continue;
-                    AppleReading r = kv.Value;
-                    if ((now - r.At).TotalSeconds > 120 || r.Rssi < AppleScanner.RssiNearby) continue;
-                    string name = Models.Name(kv.Key);
-                    int count = 0; string only = null;
-                    foreach (AppleDev a in sn.Apple) if (a.Pid == kv.Key) { count++; only = a.Name; }
-                    if (count == 1) name = only;
-                    list.Add(AppleItem(name, "pid" + kv.Key, kv.Key, r, null, now, true));
-                }
             }
 
             foreach (DriveItem d in drives)
