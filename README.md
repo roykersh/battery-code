@@ -1,4 +1,4 @@
-# Battery Float
+# <img src="assets/icon.png" alt="" width="40" align="absmiddle"> Battery Code
 
 A small tab under the laptop camera, at the top centre of the screen. It is there **only while a battery device or an
 external USB drive is connected**. Hover it and it slides open into an info bar showing up to 4 connections. Move the mouse
@@ -9,7 +9,7 @@ away and it closes.
 *Made-up devices, drawn by the widget's own code (`batteryfloat.exe --demo`).*
 
 ## Install
-Download `batteryfloat.exe` from the [latest release](https://github.com/roykersh/battery-float/releases/latest), put it
+Download `batteryfloat.exe` from the [latest release](https://github.com/roykersh/battery-code/releases/latest), put it
 in a folder of your own (for example `C:\Tools\battery-float\bin`) and run it once. It adds itself to Windows startup.
 There is nothing else to install: Windows 10/11 already ships .NET Framework 4.8.
 
@@ -40,7 +40,7 @@ To build it yourself instead: `tools\build.cmd` (writes `bin\batteryfloat.exe`).
 - It hides while a fullscreen app or presentation runs.
 - Right-click the open bar for Start with Windows, hide during fullscreen apps, Refresh, Diagnostics and Exit.
 - **Bluetooth resets.** Turning Bluetooth off and on, sleep and resume, or a restart of the Bluetooth service can silently kill
-  the advert listener. Battery Float rebuilds it on its own:
+  the advert listener. Battery Code rebuilds it on its own:
   - when Windows stops it;
   - when a scan finds it not running;
   - after resume from sleep;
