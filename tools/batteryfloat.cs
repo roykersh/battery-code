@@ -22,6 +22,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -71,6 +72,21 @@ namespace BatteryFloat
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inBuf, int inSize, byte[] outBuf, int outSize, out int returned, IntPtr overlapped);
         [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        public static extern int CM_Get_Device_Interface_List_SizeW(out uint len, ref Guid cls, string id, uint flags);
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        public static extern int CM_Get_Device_Interface_ListW(ref Guid cls, string id, [Out] char[] buffer, uint len, uint flags);
+        [DllImport("hid.dll", SetLastError = true)]
+        public static extern bool HidD_GetFeature(IntPtr h, byte[] buf, int len);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool ReadFile(IntPtr h, IntPtr buf, int len, IntPtr read, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetOverlappedResult(IntPtr h, IntPtr overlapped, out int read, bool wait);
+        [DllImport("kernel32.dll")] public static extern bool CancelIoEx(IntPtr h, IntPtr overlapped);
+        [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr CreateEventW(IntPtr sec, bool manualReset, bool initial, string name);
 
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -339,6 +355,118 @@ namespace BatteryFloat
             if (gb >= 10) return gb.ToString("0") + " GB";
             if (gb >= 1) return gb.ToString("0.0") + " GB";
             return (bytes / 1048576.0).ToString("0") + " MB";
+        }
+    }
+
+    // ---------------------------------------------------------------- PlayStation controllers
+
+    class PadReading { public string Name; public int Pct; public bool Charging, Full, Usb; public DateTime At; }
+
+    // DualSense / DualSense Edge: Windows has no battery value for them, so the status byte is read from the controller's own
+    // HID input report. Read-only: the handle is shared (games keep working) and nothing is written to the controller.
+    static class Pads
+    {
+        static Guid HidClass = new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
+        static readonly Regex PadPath = new Regex(@"054c[&_]pid[&_]0(ce6|df2)", RegexOptions.IgnoreCase);
+
+        static string[] Paths()
+        {
+            for (int tries = 0; tries < 4; tries++)
+            {
+                uint len;
+                if (Native.CM_Get_Device_Interface_List_SizeW(out len, ref HidClass, null, 0) != 0 || len <= 1) return new string[0];
+                char[] buf = new char[len];
+                int cr = Native.CM_Get_Device_Interface_ListW(ref HidClass, null, buf, len, 0);
+                if (cr == 0) return new string(buf).Split(new char[] { '\0' }, StringSplitOptions.RemoveEmptyEntries);
+                if (cr != 0x1A) return new string[0]; // CR_BUFFER_SMALL: list grew, retry
+            }
+            return new string[0];
+        }
+
+        public static List<PadReading> Read(List<string> log)
+        {
+            var list = new List<PadReading>();
+            foreach (string path in Paths())
+            {
+                Match m = PadPath.Match(path);
+                if (!m.Success) continue;
+                string name = m.Groups[1].Value.ToLowerInvariant() == "df2" ? "DualSense Edge" : "DualSense";
+                bool usb = path.ToLowerInvariant().Contains("vid_054c");
+                if (log != null) log.Add("read " + path);
+                try
+                {
+                    PadReading r = ReadOne(path, name, usb, log);
+                    if (r != null) list.Add(r);
+                }
+                catch (Exception e) { if (log != null) log.Add("  error " + e.Message); }
+            }
+            return list;
+        }
+
+        static PadReading ReadOne(string path, string name, bool usb, List<string> log)
+        {
+            IntPtr h = Native.CreateFileW(path, 0xC0000000u, 3, IntPtr.Zero, 3, 0x40000000u, IntPtr.Zero);
+            if (h == IntPtr.Zero || h == new IntPtr(-1))
+            {
+                if (log != null) log.Add("  open failed, error " + Marshal.GetLastWin32Error());
+                return null;
+            }
+            IntPtr ev = IntPtr.Zero, ov = IntPtr.Zero, buf = IntPtr.Zero;
+            try
+            {
+                // Bluetooth: reading feature report 0x05 switches the pad from short 0x01 reports (no battery) to full 0x31 reports
+                if (!usb) { byte[] f = new byte[41]; f[0] = 5; Native.HidD_GetFeature(h, f, f.Length); }
+
+                const int Size = 256;
+                byte id = usb ? (byte)0x01 : (byte)0x31;
+                int need = usb ? 64 : 78, at = usb ? 53 : 54;
+                ev = Native.CreateEventW(IntPtr.Zero, true, false, null);
+                if (ev == IntPtr.Zero) return null;
+                ov = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeOverlapped)));
+                buf = Marshal.AllocHGlobal(Size);
+                byte[] rep = new byte[Size];
+                for (int tries = 0; tries < 25; tries++)
+                {
+                    var o = new NativeOverlapped();
+                    o.EventHandle = ev;
+                    Marshal.StructureToPtr(o, ov, false);
+                    int n = 0;
+                    if (!Native.ReadFile(h, buf, Size, IntPtr.Zero, ov))
+                    {
+                        if (Marshal.GetLastWin32Error() != 997) break;      // anything but ERROR_IO_PENDING ends this path
+                        if (Native.WaitForSingleObject(ev, 150) != 0)
+                        {
+                            Native.CancelIoEx(h, ov);
+                            Native.GetOverlappedResult(h, ov, out n, true); // let the cancel finish before the buffer is reused
+                            continue;
+                        }
+                    }
+                    if (!Native.GetOverlappedResult(h, ov, out n, false)) continue;
+                    Marshal.Copy(buf, rep, 0, Size);
+                    if (n < need || rep[0] != id) continue;
+                    int status = rep[at], level = status & 0x0F, charge = (status >> 4) & 0x0F;
+                    if (log != null)
+                        log.Add(string.Format("  {0} ({1}): status byte 0x{2:X2} level={3} charge={4}", name, usb ? "USB" : "Bluetooth", status, level, charge));
+                    if (level > 10 || charge > 2) continue;
+                    var r = new PadReading();
+                    r.Name = name;
+                    r.Pct = charge == 2 ? 100 : Math.Min(level * 10 + 5, 100);
+                    r.Charging = charge == 1;
+                    r.Full = charge == 2;
+                    r.Usb = usb;
+                    r.At = DateTime.Now;
+                    return r;
+                }
+                if (log != null) log.Add("  no usable report");
+                return null;
+            }
+            finally
+            {
+                Native.CloseHandle(h);                          // no read is pending here: each one completed or was cancelled
+                if (ev != IntPtr.Zero) Native.CloseHandle(ev);
+                if (ov != IntPtr.Zero) Marshal.FreeHGlobal(ov);
+                if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
+            }
         }
     }
 
@@ -755,7 +883,7 @@ namespace BatteryFloat
 
     class Island : Form
     {
-        const string G_HEADPHONE = "\uE7F6", G_MOUSE = "\uE962", G_KEYBOARD = "\uE765", G_PAD = "\uE7FC",
+        const string G_HEADPHONE = "\uE7F6", G_MOUSE = "\uE962", G_KEYBOARD = "\uE765", G_PAD = "pad",   // "pad" = drawn by DrawPad
                      G_SPEAKER = "\uE7F5", G_BT = "\uE702", G_BOLT = "\uE945", G_USB = "\uE88E";
 
         // logical sizes (x s = physical px)
@@ -779,6 +907,7 @@ namespace BatteryFloat
         readonly AppleScanner apple = new AppleScanner();
         volatile Snapshot snap;
         volatile List<DriveItem> drives = new List<DriveItem>();
+        volatile List<PadReading> pads = new List<PadReading>();
         int scanning;
         DateTime lastScan = DateTime.MinValue;
         float s = 1f;
@@ -937,6 +1066,7 @@ namespace BatteryFloat
                     apple.EnsureRunning(sn.Apple.Count > 0); // on an MTA pool thread, as WinRT likes
                 }
                 try { drives = Drives.Scan(); } catch { }
+                try { pads = Pads.Read(null); } catch { }
                 Interlocked.Exchange(ref scanning, 0);
                 try { BeginInvoke(new MethodInvoker(delegate { RefreshItems(false); if (!statusWritten) { statusWritten = true; WriteStatus(); } })); } catch { }
             });
@@ -947,7 +1077,8 @@ namespace BatteryFloat
             string n = (name ?? "").ToLowerInvariant();
             if (n.Contains("mouse") || n.Contains("mx master") || n.Contains("mx anywhere") || n.Contains("trackball")) return G_MOUSE;
             if (n.Contains("keyboard") || n.Contains("keys")) return G_KEYBOARD;
-            if (n.Contains("controller") || n.Contains("gamepad") || n.Contains("xbox") || n.Contains("dualsense") || n.Contains("dualshock") || n.Contains("joy-con")) return G_PAD;
+            if (n.Contains("controller") || n.Contains("gamepad") || n.Contains("xbox") || n.Contains("dualsense") || n.Contains("dualshock") || n.Contains("joy-con") ||
+                n.Contains("wireless controller") || n.Contains("playstation")) return G_PAD;
             if (n.Contains("speaker") || n.Contains("soundcore") || n.Contains("boom")) return G_SPEAKER;
             if (n.Contains("airpods") || n.Contains("buds") || n.Contains("head") || n.Contains("beats") || n.Contains("wh-") || n.Contains("wf-") ||
                 n.Contains("jbl") || n.Contains("bose") || n.Contains("audio") || n.Contains("pods") || n.Contains("earphone")) return G_HEADPHONE;
@@ -1030,12 +1161,30 @@ namespace BatteryFloat
                     list.Add(AppleItem(a.Name, a.Mac, a.Pid, r, win));
                 }
 
+                // PlayStation controllers, read from their own HID report. With the cable in, a pad has both a USB and a
+                // Bluetooth interface for a while: USB first, one item per name.
+                var padNames = new HashSet<string>();
+                foreach (PadReading p in pads.OrderBy(x => x.Usb ? 0 : 1))
+                {
+                    if (!padNames.Add(p.Name)) continue;
+                    var it = new Item();
+                    it.Key = "pad:" + p.Name + ":" + (p.Usb ? "usb" : "bt");
+                    it.Name = p.Name;
+                    it.Glyph = G_PAD;
+                    it.Pct = p.Pct;
+                    it.Value = p.Pct + "%";
+                    it.Charging = p.Charging || p.Full;
+                    it.Detail = p.Charging ? "charging" : (p.Full ? "fully charged" : (p.Usb ? "on cable, not charging" : "Bluetooth"));
+                    list.Add(it);
+                }
+
                 // Windows-reported batteries (mice, keyboards, headsets...)
                 var winItems = new List<Item>();
                 foreach (BatteryNode b in sn.Batteries)
                 {
                     if (b.Connected == false) continue;
                     if (b.Container != Guid.Empty && covered.Contains(b.Container)) continue;
+                    if (padNames.Count > 0 && (b.Name ?? "").ToLowerInvariant().Contains("dualsense")) continue;
                     var it = new Item();
                     it.Key = "win:" + (b.Container != Guid.Empty ? b.Container.ToString() : b.Id);
                     it.Name = Display(b.Name);
@@ -1339,12 +1488,46 @@ namespace BatteryFloat
             }
         }
 
+        // Gamepad in outline art (same thin-line style as the other icons), drawn in a 24 x 16 unit box:
+        // one closed outline for body + grips, a touchpad line, a d-pad plus and four face-button dots
+        void DrawPad(Graphics g, float x, float y, float w, float h, Color c)
+        {
+            float k = Math.Min(w / 24f, h / 16f);
+            float ox = x + (w - 24 * k) / 2f, oy = y + (h - 16 * k) / 2f;
+            SmoothingMode old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float lw = Math.Max(1.2f, 1.3f * k);
+            using (var pen = new Pen(c, lw))
+            using (var thin = new Pen(c, Math.Max(1f, 0.95f * k)))
+            using (var br = new SolidBrush(c))
+            {
+                pen.LineJoin = LineJoin.Round; pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
+                thin.StartCap = LineCap.Round; thin.EndCap = LineCap.Round;
+                float[][] o = {
+                    new float[] { 4.6f, 2.3f }, new float[] { 12f, 1.7f }, new float[] { 19.4f, 2.3f }, new float[] { 22.0f, 4.6f },
+                    new float[] { 22.8f, 10.0f }, new float[] { 22.0f, 14.0f }, new float[] { 20.0f, 15.3f }, new float[] { 18.0f, 14.4f },
+                    new float[] { 16.4f, 11.6f }, new float[] { 12f, 10.8f }, new float[] { 7.6f, 11.6f }, new float[] { 6.0f, 14.4f },
+                    new float[] { 4.0f, 15.3f }, new float[] { 2.0f, 14.0f }, new float[] { 1.2f, 10.0f }, new float[] { 2.0f, 4.6f } };
+                var pts = new PointF[o.Length];
+                for (int i = 0; i < o.Length; i++) pts[i] = new PointF(ox + o[i][0] * k, oy + o[i][1] * k);
+                using (var gp = new GraphicsPath()) { gp.AddClosedCurve(pts, 0.4f); g.DrawPath(pen, gp); }
+                g.DrawLine(thin, ox + 9.6f * k, oy + 4.2f * k, ox + 14.4f * k, oy + 4.2f * k);
+                g.DrawLine(thin, ox + 4.6f * k, oy + 7.0f * k, ox + 8.0f * k, oy + 7.0f * k);
+                g.DrawLine(thin, ox + 6.3f * k, oy + 5.3f * k, ox + 6.3f * k, oy + 8.7f * k);
+                float d = 1.5f * k;
+                foreach (float[] q in new float[][] { new float[] { 17.7f, 5.4f }, new float[] { 17.7f, 8.6f }, new float[] { 16.1f, 7.0f }, new float[] { 19.3f, 7.0f } })
+                    g.FillEllipse(br, ox + q[0] * k - d / 2f, oy + q[1] * k - d / 2f, d, d);
+            }
+            g.SmoothingMode = old;
+        }
+
         void DrawItem(Graphics g, Item it, float x, float y, float a)
         {
             float sw = SegW * s, sh = SegH * s, pad = 12 * s, textX = x + 44 * s;
             Color lvl = it.Drive ? DriveColor(it.Pct) : LevelColor(it.Pct);
 
-            using (var gb = new SolidBrush(A(cGlyph, a)))
+            if (it.Glyph == G_PAD) DrawPad(g, x + pad - 1 * s, y + (sh - 18 * s) / 2f, 28 * s, 18 * s, A(cGlyph, a));
+            else using (var gb = new SolidBrush(A(cGlyph, a)))
                 g.DrawString(it.Glyph, fGlyph, gb, new RectangleF(x + pad, y, 26 * s, sh), sfCenter);
 
             // value on the right, with a bolt when charging
@@ -1628,6 +1811,16 @@ namespace BatteryFloat
             foreach (string l in dlog) sb.AppendLine("  " + l);
             foreach (DriveItem d in drives)
                 sb.AppendLine(string.Format("  shown: {0} {1}  {2} free of {3}", d.Letter, d.Label, Drives.Size(d.Free), Drives.Size(d.Total)));
+
+            sb.AppendLine();
+            sb.AppendLine("PlayStation controllers (DualSense / Edge, HID input report status byte):");
+            var plog = new List<string>();
+            List<PadReading> pads = Pads.Read(plog);
+            foreach (string l in plog) sb.AppendLine("  " + l);
+            foreach (PadReading p in pads)
+                sb.AppendLine(string.Format("  shown: {0} {1}%  {2}  {3}", p.Name, p.Pct, p.Usb ? "USB" : "Bluetooth",
+                    p.Full ? "fully charged" : (p.Charging ? "charging" : "discharging")));
+            if (plog.Count == 0) sb.AppendLine("  (no DualSense found)");
 
             var scanner = new AppleScanner();
             scanner.SetSnapshot(s);

@@ -68,6 +68,11 @@ To build it yourself instead: `tools\build.cmd` (writes `bin\batteryfloat.exe`).
    - every Removable drive;
    - Fixed drives whose storage bus is USB, SD or MMC (`IOCTL_STORAGE_QUERY_PROPERTY`);
    - never the system drive, nor virtual drives such as Google Drive.
+4. **PlayStation controllers (DualSense, DualSense Edge).** Windows has no battery value for them, so it is read from the
+   controller's own HID input report (USB report 0x01 byte 53, Bluetooth report 0x31 byte 54): the low nibble is the level
+   (0-10), the high nibble says discharging, charging or full. It only asks the controller for this battery byte: the handle is
+   shared, so games keep working, and nothing is written. On Bluetooth it first reads feature report 0x05, which just switches the
+   pad to its full reports. Charging shows a bolt.
 
 **Not covered:** 2.4 GHz dongle devices such as Logitech Lightspeed or Razer HyperSpeed need vendor protocols, so use the free
 HaloBattery (github.com/HeyOkay/HaloBattery) for those. Thunderbolt/NVMe external SSDs report the NVMe bus and are left out.
@@ -76,7 +81,8 @@ HaloBattery (github.com/HeyOkay/HaloBattery) for those. Thunderbolt/NVMe externa
 - `bin\batteryfloat.exe`: the app. It is one small exe with no installs (.NET Framework 4.8 and WinRT Bluetooth).
 - `tools\batteryfloat.cs`, `tools\build.cmd`: the source, built with the in-box `csc.exe` (C# 5). Exit the app before rebuilding.
 - `batteryfloat.exe --dump <file>`: a diagnostic report. It lists the Bluetooth devices, the Windows battery values, the paired
-  Apple models, and every drive with its bus type and why it was included or excluded. It then logs 12 s of Apple adverts with the
+  Apple models, every drive with its bus type and why it was included or excluded, and the raw status byte of each
+  PlayStation controller. It then logs 12 s of Apple adverts with the
   accept/ignore reason for each.
 - `%LOCALAPPDATA%\BatteryFloat\live-status.txt`: the running app rewrites it every 30 s. It shows the listener state, how often
   it was rebuilt and why, how long ago an advert (any, Apple battery, accepted) arrived, the age of the last device scan, and
