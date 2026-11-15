@@ -24,7 +24,10 @@ To build it yourself instead: `tools\build.cmd` (writes `bin\batteryfloat.exe`).
 - **Detail lines:**
   - AirPods with buds and a case show `L 70  R 80  Case 40`.
   - Drives show `free of 58 GB`.
-  - A reading older than 2 minutes goes grey and says `seen 3 min ago`.
+  - AirPods that are connected but have not broadcast yet show `waiting for signal`.
+- **Connected AirPods always show their last reading** in full colour, however old it is: AirPods go quiet for minutes
+  while connected, so there is no grey "seen N min ago" state. When they disconnect (or the battery runs out) the item
+  goes away after about 45 s, which rides out a quick reconnect.
 - **Charging:** a bolt appears next to the value.
 - **The closed tab** shows one short bar: the lowest battery, or the fullest drive when only drives are connected.
 - **Up to 4 slots:** batteries come first, with room kept for up to 2 drives.
@@ -35,7 +38,17 @@ To build it yourself instead: `tools\build.cmd` (writes `bin\batteryfloat.exe`).
 - Clicks pass through the closed tab.
 - It closes 180 ms after the pointer leaves the bar.
 - It hides while a fullscreen app or presentation runs.
-- Right-click the open bar for Start with Windows, hide during fullscreen apps, Refresh and Exit.
+- Right-click the open bar for Start with Windows, hide during fullscreen apps, Refresh, Diagnostics and Exit.
+- **Bluetooth resets.** Turning Bluetooth off and on, sleep and resume, or a restart of the Bluetooth service can silently kill
+  the advert listener. Battery Float rebuilds it on its own:
+  - when Windows stops it;
+  - when a scan finds it not running;
+  - after resume from sleep;
+  - from a watchdog when no advert at all arrives for 25 s, or when AirPods are connected but no reading has been
+    accepted for 25 s. The watchdog backs off up to 5 min while things stay quiet.
+- **After a device change** (and after resume) it rescans every 5 s for a minute, because AirPods come up one service at a time.
+  A scan taken mid-reconnect that says "not connected" does not throw readings away: a device counts as connected for 45 s
+  after a scan last saw it connected.
 - Starts with Windows through `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\BatteryFloat`. The value is rewritten on every
   start unless the menu option is unticked. Settings are in `%LOCALAPPDATA%\BatteryFloat\settings.ini`.
 - It sits on the **primary** screen.
@@ -65,13 +78,18 @@ HaloBattery (github.com/HeyOkay/HaloBattery) for those. Thunderbolt/NVMe externa
 - `batteryfloat.exe --dump <file>`: a diagnostic report. It lists the Bluetooth devices, the Windows battery values, the paired
   Apple models, and every drive with its bus type and why it was included or excluded. It then logs 12 s of Apple adverts with the
   accept/ignore reason for each.
+- `%LOCALAPPDATA%\BatteryFloat\live-status.txt`: the running app rewrites it every 30 s. It shows the listener state, how often
+  it was rebuilt and why, how long ago an advert (any, Apple battery, accepted) arrived, the age of the last device scan, and
+  the items shown. Right-click > **Diagnostics** rewrites it and opens it in Notepad. Use it when the bar looks wrong;
+  `--dump` starts a separate listener, so it cannot see the running app's state.
 - `batteryfloat.exe --pinned`: stays open, for screenshots.
 - To rebuild the GIF: `batteryfloat.exe --demo <dir>`, then `py -3.13 tools\make_gif.py <dir>`. The result goes to `assets\showcase.gif`.
 
 ## What it touches
 - **Registry**: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\BatteryFloat` (start with Windows). Untick the menu option to
   remove it.
-- **Files**: `%LOCALAPPDATA%\BatteryFloat\settings.ini`, plus the report or frames you ask for with `--dump` / `--demo`.
+- **Files**: `%LOCALAPPDATA%\BatteryFloat\settings.ini` and `live-status.txt`, plus the report or frames you ask for with
+  `--dump` / `--demo`.
 - **Bluetooth and drives**: read only. It listens to BLE adverts and reads battery and free-space values, and never pairs,
   connects or writes anything.
 - **Network**: none.

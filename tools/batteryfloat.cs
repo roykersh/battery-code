@@ -17,6 +17,7 @@
 // batteryfloat.exe --dump F   write a diagnostic report to file F (12 s of listening) and exit
 // batteryfloat.exe --pinned   stay open (for screenshots / testing)
 // batteryfloat.exe --demo D   render the showcase GIF frames (made-up devices) into folder D
+// The running app rewrites %LOCALAPPDATA%\BatteryFloat\live-status.txt every 30 s (right-click > Diagnostics opens it).
 
 using System;
 using System.Collections.Generic;
@@ -408,51 +409,167 @@ namespace BatteryFloat
         }
     }
 
+    // Listens to BLE adverts. The watcher dies quietly when the Bluetooth radio or service resets (toggle, sleep/resume,
+    // bthserv restart): it goes Stopped/Aborted, or stays Started and delivers nothing. So it is rebuilt when it stops
+    // without being asked to, when a scan finds it not Started, and by a watchdog when adverts dry up.
     class AppleScanner
     {
         public const int RssiConnected = -75;  // our own, connected AirPods: close by
+        public const double GraceSec = 45;     // a device counts as connected this long after a scan last saw it connected
+        const double QuietSec = 25;            // watchdog: no advert for this long -> rebuild (doubles while it stays quiet)
 
         readonly object gate = new object();
         readonly object wlock = new object();
         readonly Dictionary<int, AppleReading> readings = new Dictionary<int, AppleReading>();
+        readonly Dictionary<int, DateTime> connectedAt = new Dictionary<int, DateTime>();   // pid -> last scan that saw it connected (UTC)
         volatile Snapshot snap;
         BluetoothLEAdvertisementWatcher w;
-        public volatile string LastError;
+        bool wanted;                // false: we stopped it on purpose (no paired Apple device, exit)
+        DateTime startedAt = DateTime.MinValue, retryAt = DateTime.MinValue;
+        int failures;
+        double deadLimit = QuietSec, quietLimit = QuietSec;
+        long lastAnyTicks, lastAppleTicks, lastAcceptedTicks;   // UTC ticks: any advert, any Apple 0x07 frame, an accepted frame
+        public volatile string LastError, LastRecreate;
+        public int Recreates;
         public Action<AppleReading, bool, string> Trace;
 
-        public void SetSnapshot(Snapshot s) { snap = s; }
+        public void SetSnapshot(Snapshot s)
+        {
+            DateTime now = DateTime.UtcNow;
+            lock (gate)
+            {
+                foreach (AppleDev a in s.Apple) if (a.Connected) connectedAt[a.Pid] = now;
+                // a model that has been disconnected past the grace loses its reading: a reconnect starts fresh
+                var drop = new List<int>();
+                foreach (int pid in readings.Keys) if (!RecentlyConnected(pid, now)) drop.Add(pid);
+                foreach (int pid in drop) readings.Remove(pid);
+            }
+            snap = s;
+        }
+
+        bool RecentlyConnected(int pid, DateTime nowUtc)   // caller holds gate
+        {
+            DateTime t;
+            return connectedAt.TryGetValue(pid, out t) && (nowUtc - t).TotalSeconds < GraceSec;
+        }
 
         public void EnsureRunning(bool want)
         {
             lock (wlock)
             {
-                try
+                wanted = want;
+                if (!want) { Discard(); return; }
+                if (w != null && w.Status == BluetoothLEAdvertisementWatcherStatus.Started) return;
+                if (w == null && Recreates == 0 && startedAt == DateTime.MinValue) StartNew(null);
+                else StartNew("scan found the watcher " + (w == null ? "missing" : w.Status.ToString()));
+            }
+        }
+
+        // rebuild now (resume from sleep, watchdog); call from a pool thread
+        public void Recreate(string reason)
+        {
+            lock (wlock) { if (wanted) StartNew(reason); }
+        }
+
+        void Discard()   // caller holds wlock; unhooks first so our own Stop never looks like a radio reset
+        {
+            if (w == null) return;
+            var old = w;
+            w = null;
+            try { old.Received -= OnReceived; old.Stopped -= OnStopped; } catch { }
+            try { if (old.Status == BluetoothLEAdvertisementWatcherStatus.Started) old.Stop(); } catch { }
+        }
+
+        void StartNew(string reason)   // caller holds wlock
+        {
+            DateTime now = DateTime.UtcNow;
+            if (reason != null && now < retryAt) return;   // radio still down: back off
+            Discard();
+            if (reason != null) { Recreates++; LastRecreate = DateTime.Now.ToString("HH:mm:ss") + " " + reason; }
+            try
+            {
+                var nw = new BluetoothLEAdvertisementWatcher();
+                nw.ScanningMode = BluetoothLEScanningMode.Passive;
+                nw.Received += OnReceived;
+                nw.Stopped += OnStopped;
+                w = nw;
+                nw.Start();
+                if (nw.Status == BluetoothLEAdvertisementWatcherStatus.Aborted) throw new Exception("watcher aborted on start");
+                startedAt = now;
+                if (nw.Status == BluetoothLEAdvertisementWatcherStatus.Started)
                 {
-                    if (!want)
-                    {
-                        if (w != null && w.Status == BluetoothLEAdvertisementWatcherStatus.Started) w.Stop();
-                        return;
-                    }
-                    if (w != null && w.Status == BluetoothLEAdvertisementWatcherStatus.Aborted)
-                    {
-                        w.Received -= OnReceived;
-                        w = null;
-                    }
-                    if (w == null)
-                    {
-                        w = new BluetoothLEAdvertisementWatcher();
-                        w.ScanningMode = BluetoothLEScanningMode.Passive;
-                        w.Received += OnReceived;
-                    }
-                    if (w.Status != BluetoothLEAdvertisementWatcherStatus.Started) w.Start();
+                    failures = 0;
+                    retryAt = DateTime.MinValue;
                     LastError = null;
                 }
-                catch (Exception ex)
+                else
                 {
-                    LastError = ex.Message;
-                    w = null;
+                    // Bluetooth turned off: Start() does not throw, the watcher just sits in Created. Keep it, retry later.
+                    failures++;
+                    retryAt = now.AddSeconds(Math.Min(60, 2 << Math.Min(failures, 5)));
+                    LastError = "watcher " + nw.Status + " after Start (Bluetooth off?)";
                 }
             }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                Discard();
+                failures++;
+                retryAt = now.AddSeconds(Math.Min(60, 2 << Math.Min(failures, 5)));   // 4, 8 ... 60 s
+            }
+        }
+
+        void OnStopped(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementWatcherStoppedEventArgs e)
+        {
+            string why = "watcher stopped by Windows (" + e.Error + ")";
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Thread.Sleep(2000);   // let the radio come back
+                lock (wlock)
+                {
+                    if (!wanted || sender != w) return;
+                    StartNew(why);   // honours the retry back-off, so Bluetooth off does not spin
+                }
+            });
+        }
+
+        // every ~10 s from a pool thread
+        public void Watchdog()
+        {
+            lock (wlock)
+            {
+                if (!wanted) return;
+                DateTime now = DateTime.UtcNow;
+                if (w == null || w.Status != BluetoothLEAdvertisementWatcherStatus.Started)
+                {
+                    StartNew("watchdog found the watcher " + (w == null ? "missing" : w.Status.ToString()));
+                    return;
+                }
+                double up = (now - startedAt).TotalSeconds;
+                if (up < QuietSec) return;
+                double sinceAny = Since(lastAnyTicks, now);
+                if (sinceAny >= deadLimit && up >= deadLimit)
+                {
+                    deadLimit = Math.Min(deadLimit * 2, 300);
+                    StartNew("no adverts at all for " + (int)Math.Min(sinceAny, up) + " s");
+                    return;
+                }
+                bool connected = false;
+                Snapshot s = snap;
+                if (s != null) foreach (AppleDev a in s.Apple) if (a.Connected) connected = true;
+                double sinceAcc = Since(lastAcceptedTicks, now);
+                if (connected && sinceAcc >= quietLimit && up >= quietLimit)
+                {
+                    quietLimit = Math.Min(quietLimit * 2, 300);
+                    StartNew("AirPods connected but no accepted advert for " + (int)Math.Min(sinceAcc, up) + " s");
+                }
+            }
+        }
+
+        static double Since(long ticks, DateTime nowUtc)
+        {
+            long t = ticks;
+            return t == 0 ? double.MaxValue : (nowUtc - new DateTime(t, DateTimeKind.Utc)).TotalSeconds;
         }
 
         public string Status
@@ -460,8 +577,46 @@ namespace BatteryFloat
             get { lock (wlock) { return w == null ? "none" : w.Status.ToString(); } }
         }
 
+        public string Health()
+        {
+            DateTime now = DateTime.UtcNow;
+            var sb = new StringBuilder();
+            // called on the UI thread: never wait long for a Start()/Stop() that is stuck in a radio reset
+            if (Monitor.TryEnter(wlock, 250))
+            {
+                try
+                {
+                    sb.AppendLine("watcher: " + (w == null ? "none" : w.Status.ToString()) + (wanted ? "" : " (not wanted: no paired Apple device)"));
+                    sb.AppendLine("watcher started: " + (startedAt == DateTime.MinValue ? "never" : Age((now - startedAt).TotalSeconds)));
+                }
+                finally { Monitor.Exit(wlock); }
+            }
+            else sb.AppendLine("watcher: busy (being rebuilt)");
+            sb.AppendLine("watcher recreated: " + Recreates + (LastRecreate != null ? "  (last " + LastRecreate + ")" : ""));
+            string err = LastError;
+            if (err != null) sb.AppendLine("last error: " + err + "  (failures in a row " + failures + ")");
+            sb.AppendLine("last advert (any): " + Age(Since(lastAnyTicks, now)));
+            sb.AppendLine("last Apple battery frame: " + Age(Since(lastAppleTicks, now)));
+            sb.AppendLine("last accepted frame: " + Age(Since(lastAcceptedTicks, now)));
+            lock (gate)
+            {
+                foreach (var kv in connectedAt)
+                    sb.AppendLine(string.Format("model 0x{0:X4} ({1}): last seen connected {2}, reading {3}", kv.Key, Models.Name(kv.Key),
+                        Age((now - kv.Value).TotalSeconds), readings.ContainsKey(kv.Key) ? readings[kv.Key].Describe() : "none"));
+            }
+            return sb.ToString();
+        }
+
+        public static string Age(double sec)
+        {
+            if (sec == double.MaxValue) return "never";
+            return ((int)sec) + " s ago";
+        }
+
         void OnReceived(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementReceivedEventArgs e)
         {
+            Interlocked.Exchange(ref lastAnyTicks, DateTime.UtcNow.Ticks);
+            deadLimit = QuietSec;
             try
             {
                 foreach (var m in e.Advertisement.ManufacturerData)
@@ -470,7 +625,9 @@ namespace BatteryFloat
                     byte[] b = new byte[m.Data.Length];
                     DataReader.FromBuffer(m.Data).ReadBytes(b);
                     AppleReading r = AppleReading.Parse(b, e.RawSignalStrengthInDBm);
-                    if (r != null) Offer(r);
+                    if (r == null) continue;
+                    Interlocked.Exchange(ref lastAppleTicks, DateTime.UtcNow.Ticks);
+                    Offer(r);
                 }
             }
             catch { }
@@ -485,12 +642,14 @@ namespace BatteryFloat
                     if (a.Pid == r.Pid) { paired = true; if (a.Connected) connected = true; }
 
             string why;
-            if (!paired) why = "ignored: no paired device of this model";
-            else if (!connected) why = "ignored: not connected to this PC";
-            else if (r.Rssi < RssiConnected) why = "ignored: signal too weak (someone else's?)";
-            else
+            lock (gate)
             {
-                lock (gate)
+                // a scan taken mid-reconnect can say "not connected": trust a recent connected scan for the grace period
+                bool recent = connected || RecentlyConnected(r.Pid, DateTime.UtcNow);
+                if (!paired) why = "ignored: no paired device of this model";
+                else if (!recent) why = "ignored: not connected to this PC";
+                else if (r.Rssi < RssiConnected) why = "ignored: signal too weak (someone else's?)";
+                else
                 {
                     AppleReading cur;
                     bool have = readings.TryGetValue(r.Pid, out cur);
@@ -507,7 +666,13 @@ namespace BatteryFloat
                         readings[r.Pid] = r;
                         why = "accepted";
                     }
+                    if (why.StartsWith("accepted"))
+                    {
+                        Interlocked.Exchange(ref lastAcceptedTicks, DateTime.UtcNow.Ticks);
+                        quietLimit = QuietSec;
+                    }
                 }
+                connected = recent;
             }
             var t = Trace;
             if (t != null) t(r, connected, why);
@@ -584,8 +749,8 @@ namespace BatteryFloat
     {
         public string Key, Name, Value, Detail, Glyph;
         public int Pct = -1;
-        public bool Charging, Stale, Drive;
-        public string Sig() { return Key + "|" + Name + "|" + Value + "|" + Detail + "|" + Pct + "|" + Charging + "|" + Stale; }
+        public bool Charging, Drive;
+        public string Sig() { return Key + "|" + Name + "|" + Value + "|" + Detail + "|" + Pct + "|" + Charging; }
     }
 
     class Island : Form
@@ -633,7 +798,10 @@ namespace BatteryFloat
         long hoverSince = -1, leaveSince = -1;
         bool fullscreen;
         ContextMenuStrip menu;
-        System.Windows.Forms.Timer anim, poll, data, scanTimer, devChange;
+        System.Windows.Forms.Timer anim, poll, data, scanTimer, devChange, burst, watchdog, statusTimer;
+        DateTime burstUntil = DateTime.MinValue;
+        bool statusWritten;
+        readonly Dictionary<string, DateTime> appleSeen = new Dictionary<string, DateTime>();   // MAC -> last snapshot that had it connected
 
         public Island(Settings cfg, bool pinned)
         {
@@ -672,6 +840,21 @@ namespace BatteryFloat
             devChange = new System.Windows.Forms.Timer();
             devChange.Interval = 1500;
             devChange.Tick += delegate { devChange.Stop(); StartScan(); };
+
+            // after a device change or resume: rescan every 5 s for 60 s (AirPods service nodes come up one by one)
+            burst = new System.Windows.Forms.Timer();
+            burst.Interval = 5000;
+            burst.Tick += delegate { if (DateTime.UtcNow > burstUntil) burst.Stop(); else StartScan(); };
+
+            watchdog = new System.Windows.Forms.Timer();
+            watchdog.Interval = 10000;
+            watchdog.Tick += delegate { ThreadPool.QueueUserWorkItem(delegate { try { apple.Watchdog(); } catch { } }); };
+            watchdog.Start();
+
+            statusTimer = new System.Windows.Forms.Timer();
+            statusTimer.Interval = 30000;
+            statusTimer.Tick += delegate { WriteStatus(); };
+            statusTimer.Start();
 
             StartScan();
         }
@@ -755,7 +938,7 @@ namespace BatteryFloat
                 }
                 try { drives = Drives.Scan(); } catch { }
                 Interlocked.Exchange(ref scanning, 0);
-                try { BeginInvoke(new MethodInvoker(delegate { RefreshItems(false); })); } catch { }
+                try { BeginInvoke(new MethodInvoker(delegate { RefreshItems(false); if (!statusWritten) { statusWritten = true; WriteStatus(); } })); } catch { }
             });
         }
 
@@ -784,16 +967,11 @@ namespace BatteryFloat
             return Regex.Replace(sb.ToString(), @"\s+", " ").Trim();
         }
 
-        static string Ago(double sec)
-        {
-            if (sec < 60) return "<1 min ago";
-            if (sec < 3600) return ((int)(sec / 60)) + " min ago";
-            return ((int)(sec / 3600)) + " h ago";
-        }
-
         static string N(int v) { return AppleReading.Valid(v) ? (v * 10).ToString() : "–"; }
 
-        Item AppleItem(string name, string key, int pid, AppleReading r, BatteryNode win, DateTime now)
+        // AirPods stop advertising for minutes while connected, so a connected device always shows its last reading in
+        // full colour, whatever its age. The reading is dropped once the device has been disconnected past the grace.
+        Item AppleItem(string name, string key, int pid, AppleReading r, BatteryNode win)
         {
             var it = new Item();
             it.Key = "apple:" + key;
@@ -806,8 +984,6 @@ namespace BatteryFloat
                 it.Detail = "waiting for signal";
                 return it;
             }
-            double age = (now - r.At).TotalSeconds;
-            it.Stale = age > 120;
             if (Models.IsSingle(pid))
             {
                 int v = Math.Max(AppleReading.Valid(r.Left) ? r.Left : -1, AppleReading.Valid(r.Right) ? r.Right : -1);
@@ -823,7 +999,6 @@ namespace BatteryFloat
                 it.Detail = "L " + N(r.Left) + "  R " + N(r.Right) + "  Case " + N(r.Case);
             }
             it.Value = it.Pct >= 0 ? it.Pct + "%" : "—";
-            if (it.Stale) { it.Charging = false; it.Detail = "seen " + Ago(age); }
             return it;
         }
 
@@ -838,16 +1013,21 @@ namespace BatteryFloat
                 var usedPid = new HashSet<int>();
                 var covered = new HashSet<Guid>();
 
-                // AirPods / Beats connected to this PC
-                foreach (AppleDev a in sn.Apple)
+                // AirPods / Beats connected to this PC (kept through a short reconnect, then removed).
+                // Connected ones first, so a same-model device still in its grace never takes the reading.
+                var apples = sn.Apple.FindAll(x => x.Connected);
+                apples.AddRange(sn.Apple.FindAll(x => !x.Connected));
+                foreach (AppleDev a in apples)
                 {
-                    if (!a.Connected) continue;
+                    DateTime seen;
+                    if (a.Connected) appleSeen[a.Mac] = sn.At;
+                    else if (!appleSeen.TryGetValue(a.Mac, out seen) || (now - seen).TotalSeconds >= AppleScanner.GraceSec) continue;
                     AppleReading r = null;
                     if (usedPid.Add(a.Pid)) readings.TryGetValue(a.Pid, out r);
                     BatteryNode win = null;
                     foreach (BatteryNode b in sn.Batteries) if (a.Container != Guid.Empty && b.Container == a.Container) win = b;
                     if (a.Container != Guid.Empty) covered.Add(a.Container);
-                    list.Add(AppleItem(a.Name, a.Mac, a.Pid, r, win, now));
+                    list.Add(AppleItem(a.Name, a.Mac, a.Pid, r, win));
                 }
 
                 // Windows-reported batteries (mice, keyboards, headsets...)
@@ -905,7 +1085,7 @@ namespace BatteryFloat
             foreach (Item it in list)
             {
                 sb.Append(it.Sig()).Append('\n');
-                if (!it.Drive && !it.Stale && it.Pct >= 0 && (low < 0 || it.Pct < low)) low = it.Pct;
+                if (!it.Drive && it.Pct >= 0 && (low < 0 || it.Pct < low)) low = it.Pct;
             }
             string sig = sb.ToString();
             if (!force && sig == itemsSig && low == lowest) return;
@@ -922,7 +1102,8 @@ namespace BatteryFloat
             int st;
             bool fs = false;
             if (Native.SHQueryUserNotificationState(out st) == 0) fs = st == 2 || st == 3 || st == 4; // busy / D3D fullscreen / presentation
-            if (fs != fullscreen) { fullscreen = fs; UpdateVisibility(); }
+            if (fs != fullscreen) fullscreen = fs;
+            UpdateVisibility();   // also hides the tab shown at start when nothing is connected
             if (Visible)
                 Native.SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200); // stay topmost
             RefreshItems(false);
@@ -1161,9 +1342,9 @@ namespace BatteryFloat
         void DrawItem(Graphics g, Item it, float x, float y, float a)
         {
             float sw = SegW * s, sh = SegH * s, pad = 12 * s, textX = x + 44 * s;
-            Color lvl = it.Stale ? cDim : (it.Drive ? DriveColor(it.Pct) : LevelColor(it.Pct));
+            Color lvl = it.Drive ? DriveColor(it.Pct) : LevelColor(it.Pct);
 
-            using (var gb = new SolidBrush(A(it.Stale ? cDim : cGlyph, a)))
+            using (var gb = new SolidBrush(A(cGlyph, a)))
                 g.DrawString(it.Glyph, fGlyph, gb, new RectangleF(x + pad, y, 26 * s, sh), sfCenter);
 
             // value on the right, with a bolt when charging
@@ -1172,7 +1353,7 @@ namespace BatteryFloat
             float vw = Math.Min(vs.Width, 80 * s);
             float right = x + sw - pad;
             var nearRight = new StringFormat(sfCenter); nearRight.Alignment = StringAlignment.Far;
-            using (var vb = new SolidBrush(A(it.Stale ? cDim : cText, a)))
+            using (var vb = new SolidBrush(A(cText, a)))
                 g.DrawString(val, fValue, vb, new RectangleF(right - 80 * s, y + 7 * s, 80 * s, 20 * s), nearRight);
             float nameRight = right - vw - 6 * s;
             if (it.Charging)
@@ -1183,7 +1364,7 @@ namespace BatteryFloat
             }
 
             var nameFmt = new StringFormat(sfCenter); nameFmt.Alignment = StringAlignment.Near;
-            using (var nb = new SolidBrush(A(it.Stale ? cDim : cName, a)))
+            using (var nb = new SolidBrush(A(cName, a)))
                 g.DrawString(it.Name ?? "", fName, nb, new RectangleF(textX, y + 7 * s, Math.Max(10, nameRight - textX), 20 * s), nameFmt);
 
             float barW = right - textX, bh = 4 * s, by = y + 31 * s;
@@ -1337,8 +1518,13 @@ namespace BatteryFloat
             });
             var miFull = new ToolStripMenuItem("Hide during fullscreen apps", null, delegate { cfg.HideFullscreen = !cfg.HideFullscreen; cfg.Save(); UpdateVisibility(); });
             var miRefresh = new ToolStripMenuItem("Refresh", null, delegate { StartScan(); });
+            var miDiag = new ToolStripMenuItem("Diagnostics", null, delegate
+            {
+                WriteStatus();
+                try { Process.Start("notepad.exe", "\"" + StatusPath + "\""); } catch { }
+            });
             var miExit = new ToolStripMenuItem("Exit", null, delegate { ExitApp(); });
-            menu.Items.AddRange(new ToolStripItem[] { miAuto, miFull, miRefresh, new ToolStripSeparator(), miExit });
+            menu.Items.AddRange(new ToolStripItem[] { miAuto, miFull, miRefresh, miDiag, new ToolStripSeparator(), miExit });
             menu.Opening += delegate { miAuto.Checked = cfg.Autostart; miFull.Checked = cfg.HideFullscreen; };
         }
 
@@ -1354,8 +1540,55 @@ namespace BatteryFloat
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == 0x0219 && devChange != null) { devChange.Stop(); devChange.Start(); } // WM_DEVICECHANGE: drive or device added/removed
+            if (m.Msg == 0x0219 && devChange != null) { devChange.Stop(); devChange.Start(); Burst(); } // WM_DEVICECHANGE: drive or device added/removed
+            if (m.Msg == 0x0218 && burst != null)   // WM_POWERBROADCAST
+            {
+                int ev = (int)(long)m.WParam;
+                if (ev == 0x12 || ev == 0x07)       // PBT_APMRESUMEAUTOMATIC / PBT_APMRESUMESUSPEND: the radio was reset
+                {
+                    ThreadPool.QueueUserWorkItem(delegate { Thread.Sleep(3000); try { apple.Recreate("resume from sleep"); } catch { } });
+                    devChange.Stop(); devChange.Start();
+                    Burst();
+                }
+            }
             base.WndProc(ref m);
+        }
+
+        void Burst()
+        {
+            burstUntil = DateTime.UtcNow.AddSeconds(60);
+            if (!burst.Enabled) burst.Start();
+        }
+
+        // ---------------- live status (diagnostics for the running instance)
+
+        static string StatusPath { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BatteryFloat", "live-status.txt"); } }
+
+        void WriteStatus()
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("Battery Float live status  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  pid " + Process.GetCurrentProcess().Id +
+                    "  (rewritten every 30 s by the running app)");
+                sb.Append(apple.Health());
+                Snapshot sn = snap;
+                if (sn == null) sb.AppendLine("snapshot: none yet");
+                else
+                {
+                    int conn = 0;
+                    foreach (AppleDev a in sn.Apple) if (a.Connected) conn++;
+                    sb.AppendLine(string.Format("snapshot: {0}, {1} Bluetooth nodes, {2} battery values, {3} paired Apple ({4} connected)",
+                        AppleScanner.Age((DateTime.Now - sn.At).TotalSeconds), sn.Bt.Count, sn.Batteries.Count, sn.Apple.Count, conn));
+                }
+                sb.AppendLine("rescan burst: " + (burst.Enabled ? "on" : "off") + ", window " + (Visible ? "shown" : "hidden"));
+                sb.AppendLine("items shown (" + items.Count + "):");
+                foreach (Item it in items)
+                    sb.AppendLine("  " + it.Name + "  " + it.Value + (string.IsNullOrEmpty(it.Detail) ? "" : "  " + it.Detail));
+                Directory.CreateDirectory(Path.GetDirectoryName(StatusPath));
+                File.WriteAllText(StatusPath, sb.ToString(), new UTF8Encoding(true));
+            }
+            catch { }
         }
 
         void ExitApp()
